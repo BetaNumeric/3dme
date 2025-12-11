@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Interactive Me - Textured Particles</title>
+    <style>
+        /* Basic Reset & Layout */
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #050505; 
+            overflow: hidden;
+            touch-action: none; /* Prevents browser zoom/scroll while interacting */
+            user-select: none; /* Prevents text selection on double click */
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+            position: relative;
+        }
+
+        /* Loading Overlay */
+        #loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.85);
+            border: 1px solid #00ffff;
+            padding: 20px 40px;
+            border-radius: 4px;
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.15);
+            font-weight: bold;
+            color: #00ffff;
+            text-align: center;
+            max-width: 80%;
+            transition: opacity 0.5s ease;
+            z-index: 10;
+        }
+        
+        .hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .error-msg {
+            color: #ff4444;
+            font-size: 0.9em;
+            margin-top: 10px;
+            font-weight: normal;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="canvas-container">
+        <div id="loader">
+            <div id="loader-text">Generating Particles...</div>
+            <div id="error-details" class="error-msg"></div>
+        </div>
+    </div>
+
+    <!-- Import Map -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+        // --- CONFIGURATION ---
+        
+        const USER = 'BetaNumeric';
+        const REPO = '3DME';
+        const BRANCH = 'main';
+        const MODEL_FILE_NAME = 'model/me.glb'; 
+        const MODEL_URL = `https://raw.githubusercontent.com/${USER}/${REPO}/${BRANCH}/${MODEL_FILE_NAME}`;
+        
+        const PARTICLE_COUNT = 800000; 
+
+        // --- SHADERS ---
+        
+        const vertexShader = `
+            uniform float uPixelRatio;
+            uniform vec3 uMouse;
+            
+            attribute float aRandom;
+            
+            varying vec2 vUv;
+            varying vec3 vPosition;
+            varying float vDistance;
+
+            void main() {
+                vPosition = position;
+                vUv = uv; 
+                
+                vDistance = distance(position, uMouse);
+
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+                
+                // UPDATED: Random size connected to motion properties (aRandom)
+                // Base size varies from 1.0 to 4.5 based on the random attribute
+                float size = 1.0 + aRandom * 3.5;
+                
+                gl_PointSize = (size * uPixelRatio) / -mvPosition.z;
+            }
+        `;
+
+        const fragmentShader = `
+            uniform sampler2D uTexture; 
+            uniform bool uUseTexture;   
+            
+            varying vec2 vUv;
+            varying vec3 vPosition;
+            varying float vDistance;
+
+            void main() {
+                // Circle shape
+                if (distance(gl_PointCoord, vec2(0.5, 0.5)) > 0.5) discard;
+
+                vec3 finalColor;
+
+                if (uUseTexture) {
+                    vec4 texColor = texture2D(uTexture, vUv);
+                    finalColor = texColor.rgb * 1.2;
+                } else {
+                    vec3 color1 = vec3(0.0, 1.0, 0.8);
+                    vec3 color2 = vec3(0.5, 0.0, 1.0);
+                    float mixFactor = (vPosition.y + 1.0) * 0.5;
+                    finalColor = mix(color2, color1, mixFactor);
+                }
+                
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        // --- SCENE SETUP ---
+        
+        const container = document.getElementById('canvas-container');
+        const loaderElement = document.getElementById('loader');
+        const loaderText = document.getElementById('loader-text');
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x050505);
+        scene.fog = new THREE.FogExp2(0x050505, 0.05);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 3);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        container.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.minDistance = 1;
+        controls.maxDistance = 10;
+        controls.minAzimuthAngle = -Infinity;
+        controls.maxAzimuthAngle = Infinity;
+        controls.target.set(0, 0, 0);
+
+        // --- INTERACTION STATE ---
+        
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2(-100, -100);
+        const dummyPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(100, 100),
+            new THREE.MeshBasicMaterial({ visible: false })
+        );
+        scene.add(dummyPlane);
+
+        const mouse3D = new THREE.Vector3(0, 0, 0);
+        const prevMouse3D = new THREE.Vector3(0, 0, 0);
+        const mouseVelocity = new THREE.Vector3(0, 0, 0);
+        let isMouseMoving = false;
+        
+        // Pulse Effect Variables
+        let pulseIntensity = 0;
+
+        const customUniforms = {
+            uMouse: { value: new THREE.Vector3(0, 0, 0) },
+            uPixelRatio: { value: window.devicePixelRatio },
+            uTexture: { value: null },
+            uUseTexture: { value: false }
+        };
+
+        // --- PHYSICS DATA ---
+        let particles = null;
+        let originalPositions = null;
+        let currentPositions = null;
+        let velocities = null;
+        let particleRandoms = null; 
+        let particleCount = 0; 
+
+        // --- HELPER: Surface Sampler ---
+        function sampleGeometry(geometry, count) {
+            const positions = new Float32Array(count * 3);
+            const uvs = new Float32Array(count * 2);
+            
+            const posAttr = geometry.attributes.position;
+            const uvAttr = geometry.attributes.uv;
+            const indexAttr = geometry.index;
+            
+            const getPos = (i, target) => {
+                const idx = indexAttr ? indexAttr.getX(i) : i;
+                target.fromBufferAttribute(posAttr, idx);
+            };
+            
+            const getUv = (i, target) => {
+                if (!uvAttr) return target.set(0,0);
+                const idx = indexAttr ? indexAttr.getX(i) : i;
+                target.fromBufferAttribute(uvAttr, idx);
+            };
+
+            const areas = [];
+            let totalArea = 0;
+            const faceCount = (indexAttr ? indexAttr.count : posAttr.count) / 3;
+            
+            const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+            const uvA = new THREE.Vector2(), uvB = new THREE.Vector2(), uvC = new THREE.Vector2();
+
+            for (let i = 0; i < faceCount; i++) {
+                getPos(i * 3, a);
+                getPos(i * 3 + 1, b);
+                getPos(i * 3 + 2, c);
+                
+                const ab = new THREE.Vector3().subVectors(b, a);
+                const ac = new THREE.Vector3().subVectors(c, a);
+                const area = 0.5 * new THREE.Vector3().crossVectors(ab, ac).length();
+                
+                areas.push(area);
+                totalArea += area;
+            }
+
+            let generatedSoFar = 0;
+            let cumulativeArea = 0;
+
+            for (let i = 0; i < faceCount; i++) {
+                cumulativeArea += areas[i];
+                
+                const targetCount = Math.floor((cumulativeArea / totalArea) * count);
+                const countForFace = targetCount - generatedSoFar;
+                
+                if (countForFace <= 0) continue;
+
+                getPos(i * 3, a);
+                getPos(i * 3 + 1, b);
+                getPos(i * 3 + 2, c);
+                getUv(i * 3, uvA);
+                getUv(i * 3 + 1, uvB);
+                getUv(i * 3 + 2, uvC);
+
+                for (let j = 0; j < countForFace; j++) {
+                    const r1 = Math.random();
+                    const r2 = Math.random();
+                    const sqrtR1 = Math.sqrt(r1);
+                    const u = 1 - sqrtR1;
+                    const v = sqrtR1 * (1 - r2);
+                    const w = sqrtR1 * r2;
+
+                    const px = a.x * u + b.x * v + c.x * w;
+                    const py = a.y * u + b.y * v + c.y * w;
+                    const pz = a.z * u + b.z * v + c.z * w;
+                    
+                    const ux = uvA.x * u + uvB.x * v + uvC.x * w;
+                    const uy = uvA.y * u + uvB.y * v + uvC.y * w;
+
+                    positions[generatedSoFar * 3] = px;
+                    positions[generatedSoFar * 3 + 1] = py;
+                    positions[generatedSoFar * 3 + 2] = pz;
+                    
+                    uvs[generatedSoFar * 2] = ux;
+                    uvs[generatedSoFar * 2 + 1] = uy;
+
+                    generatedSoFar++;
+                }
+            }
+            
+            return { positions, uvs };
+        }
+
+        // --- LOADING ---
+
+        const gltfLoader = new GLTFLoader();
+
+        gltfLoader.load(
+            MODEL_URL, 
+            (gltf) => {
+                const model = gltf.scene;
+                let geometry = null;
+                let texture = null;
+                
+                model.updateMatrixWorld(true);
+
+                model.traverse((child) => {
+                    if (child.isMesh && !geometry) {
+                        const tempGeo = child.geometry.clone();
+                        tempGeo.applyMatrix4(child.matrixWorld);
+                        
+                        tempGeo.computeBoundingBox();
+                        const center = new THREE.Vector3();
+                        tempGeo.boundingBox.getCenter(center);
+                        tempGeo.translate(-center.x, -center.y, -center.z);
+                        
+                        if (child.material.map) {
+                            texture = child.material.map;
+                        }
+                        
+                        const sampledData = sampleGeometry(tempGeo, PARTICLE_COUNT);
+                        
+                        geometry = new THREE.BufferGeometry();
+                        geometry.setAttribute('position', new THREE.BufferAttribute(sampledData.positions, 3));
+                        geometry.setAttribute('uv', new THREE.BufferAttribute(sampledData.uvs, 2));
+                    }
+                });
+
+                if (geometry) {
+                    particleCount = geometry.attributes.position.count;
+                    
+                    originalPositions = new Float32Array(geometry.attributes.position.array);
+                    currentPositions = geometry.attributes.position.array;
+                    velocities = new Float32Array(particleCount * 3);
+                    
+                    particleRandoms = new Float32Array(particleCount);
+                    for(let i=0; i<particleCount; i++) particleRandoms[i] = Math.random();
+                    
+                    geometry.setAttribute('aRandom', new THREE.BufferAttribute(particleRandoms, 1));
+
+                    if (texture) {
+                        customUniforms.uTexture.value = texture;
+                        customUniforms.uUseTexture.value = true;
+                    }
+
+                    const material = new THREE.ShaderMaterial({
+                        uniforms: customUniforms,
+                        vertexShader: vertexShader,
+                        fragmentShader: fragmentShader,
+                        transparent: false, 
+                        depthWrite: true,   
+                        blending: THREE.NormalBlending 
+                    });
+
+                    particles = new THREE.Points(geometry, material);
+                    scene.add(particles);
+                    
+                    loaderElement.classList.add('hidden');
+                }
+            },
+            (xhr) => {
+                if(xhr.total > 0) {
+                    const percent = (xhr.loaded / xhr.total * 100).toFixed(0);
+                    loaderText.innerText = `Loading Texture: ${percent}%`;
+                }
+            }
+        );
+
+        // --- MOUSE & TOUCH TRACKING ---
+
+        function updateMouseCoords(x, y) {
+            mouse.x = (x / window.innerWidth) * 2 - 1;
+            mouse.y = -(y / window.innerHeight) * 2 + 1;
+        }
+
+        function triggerPulse() {
+            // Momentary expansion force
+            pulseIntensity = 0.8; 
+        }
+
+        window.addEventListener('mousemove', (event) => {
+            updateMouseCoords(event.clientX, event.clientY);
+            isMouseMoving = true;
+        });
+
+        window.addEventListener('mousedown', (event) => {
+            triggerPulse();
+        });
+
+        window.addEventListener('touchstart', (event) => {
+            if (event.touches.length > 0) {
+                updateMouseCoords(event.touches[0].clientX, event.touches[0].clientY);
+                triggerPulse(); // Trigger pulse on touch
+                
+                dummyPlane.lookAt(camera.position);
+                raycaster.setFromCamera(mouse, camera);
+                const intersects = raycaster.intersectObject(dummyPlane);
+                
+                if (intersects.length > 0) {
+                    const point = intersects[0].point;
+                    prevMouse3D.copy(point);
+                    mouse3D.copy(point);
+                    customUniforms.uMouse.value.copy(point);
+                }
+            }
+        }, { passive: false });
+
+        window.addEventListener('touchmove', (event) => {
+            if (event.touches.length > 0) {
+                updateMouseCoords(event.touches[0].clientX, event.touches[0].clientY);
+                isMouseMoving = true;
+            }
+        }, { passive: false });
+
+        // --- ANIMATION ---
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+
+            // Decay pulse effect
+            if (pulseIntensity > 0) {
+                pulseIntensity *= 0.92; // Rapid decay
+                if (pulseIntensity < 0.01) pulseIntensity = 0;
+            }
+
+            // 1. Mouse Tracking & Velocity Calculation
+            dummyPlane.lookAt(camera.position);
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(dummyPlane);
+
+            if (intersects.length > 0) {
+                const intersectionPoint = intersects[0].point;
+                mouseVelocity.copy(intersectionPoint).sub(prevMouse3D);
+                prevMouse3D.copy(intersectionPoint);
+                mouse3D.copy(intersectionPoint);
+                customUniforms.uMouse.value.copy(mouse3D);
+            } else {
+                mouseVelocity.set(0,0,0);
+            }
+            
+            // NEW: Calculate distance from camera to mouse to scale the interaction radius
+            // This ensures the "force field" looks the same size on screen regardless of zoom
+            const distToCamera = camera.position.distanceTo(mouse3D);
+            const zoomScale = distToCamera / 3.0; // 3.0 is our initial camera Z
+            
+            // Dynamic influence radius
+            const mouseSpeed = mouseVelocity.length();
+            
+            // Scale the min/max radius limits by zoom
+            const minR = 0.05 * zoomScale;
+            const maxR = 0.6 * zoomScale;
+            
+            let targetRadius = Math.min(Math.max(mouseSpeed * 4.0, minR), maxR); 
+            
+            // Add pulse size to radius
+            if (pulseIntensity > 0) {
+                targetRadius = Math.max(targetRadius, pulseIntensity * zoomScale);
+                isMouseMoving = true; 
+            }
+
+            const interactionRadius = isMouseMoving ? targetRadius : 0.01;
+            const interactionRadiusSq = interactionRadius * interactionRadius;
+
+            // 2. Physics Simulation
+            if (particles && originalPositions && particleRandoms) {
+                
+                const baseSpringStrength = 0.001; 
+                const baseFriction = 0.90;        
+                const baseMouseForce = 1.0; 
+
+                for (let i = 0; i < particleCount; i++) {
+                    const ix = i * 3;
+                    const iy = i * 3 + 1;
+                    const iz = i * 3 + 2;
+
+                    let px = currentPositions[ix];
+                    let py = currentPositions[iy];
+                    let pz = currentPositions[iz];
+
+                    let vx = velocities[ix];
+                    let vy = velocities[iy];
+                    let vz = velocities[iz];
+
+                    const r = particleRandoms[i];
+
+                    // Spring (Return to Home)
+                    const dx = originalPositions[ix] - px;
+                    const dy = originalPositions[iy] - py;
+                    const dz = originalPositions[iz] - pz;
+                    
+                    const effectiveSpring = baseSpringStrength * (0.5 + r); 
+                    
+                    vx += dx * effectiveSpring;
+                    vy += dy * effectiveSpring;
+                    vz += dz * effectiveSpring;
+
+                    // Interaction (Sphere of Influence)
+                    const mDx = px - mouse3D.x;
+                    const mDy = py - mouse3D.y;
+                    const mDz = pz - mouse3D.z;
+                    const distSq = mDx*mDx + mDy*mDy + mDz*mDz;
+
+                    if (distSq < interactionRadiusSq) {
+                        const dist = Math.sqrt(distSq);
+                        const influence = (1.0 - (distSq / interactionRadiusSq));
+                        
+                        if (isMouseMoving) {
+                            const effectiveForce = baseMouseForce * (0.8 + r * 0.4);
+                            
+                            // 1. Drag Force (Following movement)
+                            vx += mouseVelocity.x * effectiveForce * influence * 1.5;
+                            vy += mouseVelocity.y * effectiveForce * influence * 1.5;
+                            vz += mouseVelocity.z * effectiveForce * influence * 1.5;
+                            
+                            // 2. Radial Force (Pushing away - The "Sphere" effect)
+                            if (dist > 0.001) {
+                                const radialForce = 0.03 * (0.8 + r * 0.4); 
+                                vx += (mDx / dist) * radialForce * influence;
+                                vy += (mDy / dist) * radialForce * influence;
+                                vz += (mDz / dist) * radialForce * influence;
+                            }
+                            
+                            // 3. Extra Pulse Force
+                            if (pulseIntensity > 0) {
+                                const pulseForce = pulseIntensity * 0.05;
+                                vx += (mDx / dist) * pulseForce * influence;
+                                vy += (mDy / dist) * pulseForce * influence;
+                                vz += (mDz / dist) * pulseForce * influence;
+                            }
+                        }
+                    }
+
+                    // Apply Friction
+                    vx *= baseFriction;
+                    vy *= baseFriction;
+                    vz *= baseFriction;
+
+                    // Update Position
+                    px += vx;
+                    py += vy;
+                    pz += vz;
+
+                    // Store back
+                    currentPositions[ix] = px;
+                    currentPositions[iy] = py;
+                    currentPositions[iz] = pz;
+                    velocities[ix] = vx;
+                    velocities[iy] = vy;
+                    velocities[iz] = vz;
+                }
+
+                particles.geometry.attributes.position.needsUpdate = true;
+            }
+            
+            isMouseMoving = false;
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            customUniforms.uPixelRatio.value = window.devicePixelRatio;
+        });
+    </script>
+</body>
+</html>
