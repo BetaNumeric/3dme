@@ -87,6 +87,7 @@
         const MODEL_FILE_NAME = 'model/me.glb'; 
         const MODEL_URL = `https://raw.githubusercontent.com/${USER}/${REPO}/${BRANCH}/${MODEL_FILE_NAME}`;
         
+        // Tuned for performance/density balance
         const PARTICLE_COUNT = 800000; 
 
         // --- SHADERS ---
@@ -110,9 +111,8 @@
                 vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
                 gl_Position = projectionMatrix * mvPosition;
                 
-                // UPDATED: Random size connected to motion properties (aRandom)
-                // Base size varies from 1.0 to 4.5 based on the random attribute
-                float size = 1.0 + aRandom * 3.5;
+                // Base size varies from 1.0 to 3.0 based on the random attribute
+                float size = 1.0 + aRandom * 3.0;
                 
                 gl_PointSize = (size * uPixelRatio) / -mvPosition.z;
             }
@@ -157,7 +157,7 @@
         scene.fog = new THREE.FogExp2(0x050505, 0.05);
 
         const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
-        camera.position.set(0, 0, 3);
+        camera.position.set(0, 1, 3);
 
         const renderer = new THREE.WebGLRenderer({ antialias: true });
         renderer.setPixelRatio(window.devicePixelRatio);
@@ -187,7 +187,6 @@
         const mouseVelocity = new THREE.Vector3(0, 0, 0);
         let isMouseMoving = false;
         
-        // Pulse Effect Variables
         let pulseIntensity = 0;
 
         const customUniforms = {
@@ -375,7 +374,6 @@
         }
 
         function triggerPulse() {
-            // Momentary expansion force
             pulseIntensity = 0.8; 
         }
 
@@ -391,7 +389,7 @@
         window.addEventListener('touchstart', (event) => {
             if (event.touches.length > 0) {
                 updateMouseCoords(event.touches[0].clientX, event.touches[0].clientY);
-                triggerPulse(); // Trigger pulse on touch
+                triggerPulse(); 
                 
                 dummyPlane.lookAt(camera.position);
                 raycaster.setFromCamera(mouse, camera);
@@ -418,14 +416,18 @@
         function animate() {
             requestAnimationFrame(animate);
             controls.update();
+            
+            // Optimization: Calculate time once per frame, not per particle
+            const now = Date.now();
+            const pulseTime = now * 0.006; 
 
-            // Decay pulse effect
+            // Decay pulse
             if (pulseIntensity > 0) {
-                pulseIntensity *= 0.92; // Rapid decay
+                pulseIntensity *= 0.92;
                 if (pulseIntensity < 0.01) pulseIntensity = 0;
             }
 
-            // 1. Mouse Tracking & Velocity Calculation
+            // 1. Mouse Tracking
             dummyPlane.lookAt(camera.position);
             raycaster.setFromCamera(mouse, camera);
             const intersects = raycaster.intersectObject(dummyPlane);
@@ -440,21 +442,16 @@
                 mouseVelocity.set(0,0,0);
             }
             
-            // NEW: Calculate distance from camera to mouse to scale the interaction radius
-            // This ensures the "force field" looks the same size on screen regardless of zoom
+            // Zoom-scaled radius
             const distToCamera = camera.position.distanceTo(mouse3D);
-            const zoomScale = distToCamera / 3.0; // 3.0 is our initial camera Z
+            const zoomScale = distToCamera / 3.0;
             
-            // Dynamic influence radius
             const mouseSpeed = mouseVelocity.length();
-            
-            // Scale the min/max radius limits by zoom
             const minR = 0.05 * zoomScale;
             const maxR = 0.6 * zoomScale;
             
             let targetRadius = Math.min(Math.max(mouseSpeed * 4.0, minR), maxR); 
             
-            // Add pulse size to radius
             if (pulseIntensity > 0) {
                 targetRadius = Math.max(targetRadius, pulseIntensity * zoomScale);
                 isMouseMoving = true; 
@@ -485,7 +482,7 @@
 
                     const r = particleRandoms[i];
 
-                    // Spring (Return to Home)
+                    // Spring
                     const dx = originalPositions[ix] - px;
                     const dy = originalPositions[iy] - py;
                     const dz = originalPositions[iz] - pz;
@@ -496,7 +493,7 @@
                     vy += dy * effectiveSpring;
                     vz += dz * effectiveSpring;
 
-                    // Interaction (Sphere of Influence)
+                    // Interaction
                     const mDx = px - mouse3D.x;
                     const mDy = py - mouse3D.y;
                     const mDz = pz - mouse3D.z;
@@ -509,20 +506,31 @@
                         if (isMouseMoving) {
                             const effectiveForce = baseMouseForce * (0.8 + r * 0.4);
                             
-                            // 1. Drag Force (Following movement)
-                            vx += mouseVelocity.x * effectiveForce * influence * 1.5;
-                            vy += mouseVelocity.y * effectiveForce * influence * 1.5;
-                            vz += mouseVelocity.z * effectiveForce * influence * 1.5;
+                            // 1. Drag Force (Reduced to allow swirl to dominate)
+                            vx += mouseVelocity.x * effectiveForce * influence * 0.2;
+                            vy += mouseVelocity.y * effectiveForce * influence * 0.2;
+                            vz += mouseVelocity.z * effectiveForce * influence * 0.2;
                             
-                            // 2. Radial Force (Pushing away - The "Sphere" effect)
                             if (dist > 0.001) {
-                                const radialForce = 0.03 * (0.8 + r * 0.4); 
-                                vx += (mDx / dist) * radialForce * influence;
-                                vy += (mDy / dist) * radialForce * influence;
-                                vz += (mDz / dist) * radialForce * influence;
+                                // 2. Whirl / Vortex Force
+                                // UPDATED: Randomize swirl speed per particle using 'r'
+                                const swirlStrength = 0.15 * (0.5 + r);
+                                vx += -mDy * swirlStrength * influence; 
+                                vy += mDx * swirlStrength * influence;  
+                                
+                                // 3. Pulsating Radial Force (Heartbeat)
+                                // UPDATED: Desynchronize pulse using 'r' for a "boiling" effect
+                                const pulsePhase = r * Math.PI * 2; // Random offset 0 to 2PI
+                                const pulse = Math.sin(pulseTime + pulsePhase);
+                                
+                                const radialStrength = 0.05 * pulse * (0.8 + r * 0.4);
+
+                                vx += (mDx / dist) * radialStrength * influence;
+                                vy += (mDy / dist) * radialStrength * influence;
+                                vz += (mDz / dist) * radialStrength * influence;
                             }
                             
-                            // 3. Extra Pulse Force
+                            // 3. Pulse (Still expands on click for impact)
                             if (pulseIntensity > 0) {
                                 const pulseForce = pulseIntensity * 0.05;
                                 vx += (mDx / dist) * pulseForce * influence;
@@ -532,17 +540,15 @@
                         }
                     }
 
-                    // Apply Friction
+                    // Friction
                     vx *= baseFriction;
                     vy *= baseFriction;
                     vz *= baseFriction;
 
-                    // Update Position
                     px += vx;
                     py += vy;
                     pz += vz;
 
-                    // Store back
                     currentPositions[ix] = px;
                     currentPositions[iy] = py;
                     currentPositions[iz] = pz;
