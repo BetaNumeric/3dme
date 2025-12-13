@@ -12,8 +12,8 @@
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background-color: #050505; 
             overflow: hidden;
-            touch-action: none; /* Prevents browser zoom/scroll while interacting */
-            user-select: none; /* Prevents text selection on double click */
+            touch-action: none; 
+            user-select: none; 
         }
 
         #canvas-container {
@@ -53,6 +53,40 @@
             margin-top: 10px;
             font-weight: normal;
         }
+
+        /* DEBUG PANEL */
+        #debug-panel {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.8);
+            border: 1px solid #444;
+            color: #00ff00;
+            font-family: 'Courier New', monospace;
+            padding: 15px;
+            border-radius: 4px;
+            pointer-events: none;
+            z-index: 100;
+            font-size: 13px;
+            line-height: 1.6;
+            display: none; 
+            min-width: 200px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+
+        .debug-row {
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .debug-val {
+            font-weight: bold;
+            color: #fff;
+        }
+        
+        .val-good { color: #00ff00; }
+        .val-warn { color: #ffff00; }
+        .val-bad { color: #ff0000; }
     </style>
 </head>
 <body>
@@ -61,6 +95,17 @@
         <div id="loader">
             <div id="loader-text">Generating Particles...</div>
             <div id="error-details" class="error-msg"></div>
+        </div>
+        
+        <!-- Debug Overlay -->
+        <div id="debug-panel">
+            <div style="border-bottom: 1px solid #444; margin-bottom: 8px; padding-bottom: 4px; color: #aaa;">DEBUG MODE</div>
+            <div class="debug-row">FPS: <span id="db-fps" class="debug-val">0</span></div>
+            <div class="debug-row">Particles: <span id="db-count" class="debug-val">0</span></div>
+            <div class="debug-row">Buffer Cap: <span id="db-max" class="debug-val">0</span></div>
+            <div class="debug-row">State: <span id="db-state" class="debug-val">IDLE</span></div>
+            <div class="debug-row">Interaction: <span id="db-interact" class="debug-val">FALSE</span></div>
+            <div class="debug-row">Radius: <span id="db-radius" class="debug-val">0.00</span></div>
         </div>
     </div>
 
@@ -87,8 +132,26 @@
         const MODEL_FILE_NAME = 'model/me.glb'; 
         const MODEL_URL = `https://raw.githubusercontent.com/${USER}/${REPO}/${BRANCH}/${MODEL_FILE_NAME}`;
         
-        // Tuned for performance/density balance
         const PARTICLE_COUNT = 1000000; 
+
+        // --- DEBUG ELEMENTS ---
+        const debugPanel = document.getElementById('debug-panel');
+        const dbFps = document.getElementById('db-fps');
+        const dbCount = document.getElementById('db-count');
+        const dbMax = document.getElementById('db-max');
+        const dbState = document.getElementById('db-state');
+        const dbInteract = document.getElementById('db-interact');
+        const dbRadius = document.getElementById('db-radius');
+        
+        let isDebugVisible = false;
+        
+        window.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+                e.preventDefault();
+                isDebugVisible = !isDebugVisible;
+                debugPanel.style.display = isDebugVisible ? 'block' : 'none';
+            }
+        });
 
         // --- SHADERS ---
         
@@ -111,9 +174,7 @@
                 vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
                 gl_Position = projectionMatrix * mvPosition;
                 
-                // Base size varies from 1.0 to 3.0 based on the random attribute
                 float size = 1.0 + aRandom * 3.5;
-                
                 gl_PointSize = (size * uPixelRatio) / -mvPosition.z;
             }
         `;
@@ -127,7 +188,6 @@
             varying float vDistance;
 
             void main() {
-                // Circle shape
                 if (distance(gl_PointCoord, vec2(0.5, 0.5)) > 0.5) discard;
 
                 vec3 finalColor;
@@ -186,12 +246,10 @@
         const prevMouse3D = new THREE.Vector3(0, 0, 0);
         const mouseVelocity = new THREE.Vector3(0, 0, 0);
         
-        // Interaction Flags
-        let isDragging = false;      // Is user holding down a button/touch?
-        let isInteracting = false;   // isDragging + Hover Speed + Pulse
-        let swirlDirection = 1;      // 1 = Left Click/Hover, -1 = Right Click
+        let isDragging = false;      
+        let isInteracting = false;   
+        let swirlDirection = 1;      
         
-        // Auto-Rotation State
         let lastInteractionTime = Date.now();
         const IDLE_TIMEOUT = 3000; 
         const ROTATION_TARGET_SPEED = 2.0; 
@@ -207,17 +265,70 @@
 
         // --- PHYSICS & PERFORMANCE DATA ---
         let particles = null;
+        // Data Arrays
         let originalPositions = null;
         let currentPositions = null;
         let velocities = null;
         let particleRandoms = null; 
-        let particleCount = 0; 
+        let particleCount = 0; // The capacity of the current buffer
         
-        // Performance Monitoring
-        let activeParticleCount = 0; // The actual number currently being simulated
+        let activeParticleCount = 0; // The number we are actually updating/drawing
         let lastFpsCheck = 0;
         let frameCount = 0;
         let lowFpsStreak = 0;
+
+        // --- HELPER: Random Shuffle ---
+        function shuffleIndices(count) {
+            const indices = new Uint32Array(count);
+            for (let i = 0; i < count; i++) indices[i] = i;
+            for (let i = count - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [indices[i], indices[j]] = [indices[j], indices[i]];
+            }
+            return indices;
+        }
+
+        // --- HELPER: Buffer Compaction (Hard Optimization) ---
+        // Creates smaller buffers and disposes the old ones to free VRAM/Bandwidth
+        function compactBuffers(newCount) {
+            console.log(`Compacting buffers: ${particleCount} -> ${newCount}`);
+            
+            // 1. Slice Arrays (Create copies of the active data)
+            const newPos = currentPositions.slice(0, newCount * 3);
+            const newOrig = originalPositions.slice(0, newCount * 3);
+            const newVel = velocities.slice(0, newCount * 3);
+            const newRand = particleRandoms.slice(0, newCount);
+            
+            // UVs need to be grabbed from geometry since we don't keep a ref
+            const oldUv = particles.geometry.attributes.uv.array;
+            const newUv = oldUv.slice(0, newCount * 2);
+
+            // 2. Update References
+            originalPositions = newOrig;
+            velocities = newVel;
+            particleRandoms = newRand;
+            
+            // 3. Create New Geometry
+            const newGeo = new THREE.BufferGeometry();
+            newGeo.setAttribute('position', new THREE.BufferAttribute(newPos, 3));
+            newGeo.setAttribute('uv', new THREE.BufferAttribute(newUv, 2));
+            newGeo.setAttribute('aRandom', new THREE.BufferAttribute(newRand, 1));
+            
+            // 4. Swap and Dispose
+            particles.geometry.dispose(); // IMPORTANT: Frees GPU memory
+            particles.geometry = newGeo;
+            
+            // 5. Re-link currentPositions to the new geometry's array
+            currentPositions = particles.geometry.attributes.position.array;
+            
+            // 6. Update tracking variables
+            particles.geometry.setDrawRange(0, newCount);
+            particleCount = newCount; // Capacity is now smaller
+            activeParticleCount = newCount;
+            
+            // Tell renderer this is a new object essentially
+            particles.frustumCulled = false; 
+        }
 
         // --- HELPER: Surface Sampler ---
         function sampleGeometry(geometry, count) {
@@ -335,15 +446,35 @@
                         
                         const sampledData = sampleGeometry(tempGeo, PARTICLE_COUNT);
                         
+                        loaderText.innerText = "Optimizing Data...";
+                        
+                        const count = PARTICLE_COUNT;
+                        const shuffledIndices = shuffleIndices(count);
+                        
+                        const shuffledPos = new Float32Array(count * 3);
+                        const shuffledUv = new Float32Array(count * 2);
+                        
+                        for(let i=0; i<count; i++) {
+                            const srcIdx = shuffledIndices[i];
+                            const dstIdx = i;
+                            
+                            shuffledPos[dstIdx*3] = sampledData.positions[srcIdx*3];
+                            shuffledPos[dstIdx*3+1] = sampledData.positions[srcIdx*3+1];
+                            shuffledPos[dstIdx*3+2] = sampledData.positions[srcIdx*3+2];
+                            
+                            shuffledUv[dstIdx*2] = sampledData.uvs[srcIdx*2];
+                            shuffledUv[dstIdx*2+1] = sampledData.uvs[srcIdx*2+1];
+                        }
+                        
                         geometry = new THREE.BufferGeometry();
-                        geometry.setAttribute('position', new THREE.BufferAttribute(sampledData.positions, 3));
-                        geometry.setAttribute('uv', new THREE.BufferAttribute(sampledData.uvs, 2));
+                        geometry.setAttribute('position', new THREE.BufferAttribute(shuffledPos, 3));
+                        geometry.setAttribute('uv', new THREE.BufferAttribute(shuffledUv, 2));
                     }
                 });
 
                 if (geometry) {
                     particleCount = geometry.attributes.position.count;
-                    activeParticleCount = particleCount; // Start with full quality
+                    activeParticleCount = particleCount; 
                     
                     originalPositions = new Float32Array(geometry.attributes.position.array);
                     currentPositions = geometry.attributes.position.array;
@@ -369,11 +500,12 @@
                     });
 
                     particles = new THREE.Points(geometry, material);
+                    particles.frustumCulled = false; 
+                    
                     scene.add(particles);
                     
                     loaderElement.classList.add('hidden');
                     
-                    // Init timing for FPS check
                     lastFpsCheck = performance.now();
                 }
             },
@@ -387,13 +519,11 @@
 
         // --- MOUSE & TOUCH TRACKING ---
 
-        // Helper: Updates vector but DOES NOT reset idle timer
         function updateMouseCoords(x, y) {
             mouse.x = (x / window.innerWidth) * 2 - 1;
             mouse.y = -(y / window.innerHeight) * 2 + 1;
         }
 
-        // Helper: Resets idle timer (stops auto-rotation)
         function resetIdleTimer() {
             lastInteractionTime = Date.now();
         }
@@ -403,24 +533,16 @@
             resetIdleTimer();
         }
 
-        // Prevent Context Menu on Right Click
         window.addEventListener('contextmenu', (e) => e.preventDefault());
 
         window.addEventListener('mousemove', (event) => {
             updateMouseCoords(event.clientX, event.clientY);
-            // NOTE: We deliberately do NOT call resetIdleTimer() here.
-            // This allows the user to wave the mouse and interact with particles
-            // WITHOUT stopping the auto-rotation.
         });
 
         window.addEventListener('mousedown', (event) => {
             isDragging = true;
-            resetIdleTimer(); // Clicking stops rotation
-            
-            // Determine Swirl Direction
-            // Button 0 = Left (Clockwise), Button 2 = Right (Counter-Clockwise)
+            resetIdleTimer(); 
             swirlDirection = (event.button === 2) ? -1.0 : 1.0;
-            
             triggerPulse();
         });
 
@@ -442,7 +564,6 @@
                 isDragging = true;
                 swirlDirection = 1.0; 
                 resetIdleTimer();
-                
                 updateMouseCoords(event.touches[0].clientX, event.touches[0].clientY);
                 triggerPulse(); 
                 
@@ -475,9 +596,7 @@
         function animate() {
             requestAnimationFrame(animate);
 
-            // --- AUTO-ROTATION LOGIC ---
-            // Only auto-rotate if we are NOT dragging. 
-            // Hovering does NOT set isDragging, so rotation continues.
+            // Auto-Rotate
             if (!isDragging && Date.now() - lastInteractionTime > IDLE_TIMEOUT) {
                 controls.autoRotate = true;
                 if (controls.autoRotateSpeed < ROTATION_TARGET_SPEED) {
@@ -499,13 +618,29 @@
                 frameCount = 0;
                 lastFpsCheck = currentTime;
                 
-                if (fps < 30 && activeParticleCount > 10000) {
+                if (isDebugVisible) {
+                    dbFps.innerText = fps;
+                    dbFps.className = 'debug-val ' + (fps > 50 ? 'val-good' : (fps > 30 ? 'val-warn' : 'val-bad'));
+                    dbCount.innerText = activeParticleCount.toLocaleString();
+                    dbMax.innerText = particleCount.toLocaleString();
+                }
+                
+                if (fps < 35 && activeParticleCount > 10000) {
                     lowFpsStreak++;
                     if (lowFpsStreak >= 2) {
-                        const newCount = Math.floor(activeParticleCount * 0.8);
+                        const newCount = Math.floor(activeParticleCount * 0.7); // Drop by 30% aggressively
                         activeParticleCount = newCount;
+                        
                         particles.geometry.setDrawRange(0, activeParticleCount);
+                        
                         console.log(`Low FPS (${fps}). Reducing particles to: ${activeParticleCount}`);
+                        
+                        // NEW: Hard Optimization (Compaction)
+                        // If we are using less than 75% of the allocated buffer, trim the fat.
+                        if (activeParticleCount < particleCount * 0.75) {
+                             compactBuffers(activeParticleCount);
+                        }
+                        
                         lowFpsStreak = 0; 
                     }
                 } else {
@@ -521,7 +656,7 @@
                 if (pulseIntensity < 0.01) pulseIntensity = 0;
             }
 
-            // 1. Mouse Tracking
+            // Mouse Tracking
             dummyPlane.lookAt(camera.position);
             raycaster.setFromCamera(mouse, camera);
             const intersects = raycaster.intersectObject(dummyPlane);
@@ -536,7 +671,7 @@
                 mouseVelocity.set(0,0,0);
             }
             
-            // Interaction State Logic
+            // Interaction State
             const distToCamera = camera.position.distanceTo(mouse3D);
             const zoomScale = distToCamera / 3.0;
             
@@ -544,15 +679,11 @@
             const minR = 0.05 * zoomScale;
             const maxR = 0.6 * zoomScale;
             
-            // We interact if dragging OR if mouse is moving reasonably fast (Hover)
-            const isMoving = mouseSpeed > 0.02; // Threshold to prevent tiny jitter
+            const isMoving = mouseSpeed > 0.02; 
             isInteracting = isDragging || isMoving || pulseIntensity > 0;
             
-            // Calculate Radius
             let targetRadius = 0.01;
             
-            // If dragging, we maintain a minimum "hold" radius
-            // If just hovering, radius depends purely on speed
             if (isDragging) {
                 targetRadius = Math.max(mouseSpeed * 4.0, 0.3 * zoomScale);
             } else if (isMoving) {
@@ -566,6 +697,21 @@
 
             const interactionRadius = isInteracting ? targetRadius : 0.01;
             const interactionRadiusSq = interactionRadius * interactionRadius;
+            
+            if (isDebugVisible) {
+                let stateText = "IDLE";
+                if (isDragging) stateText = "DRAGGING";
+                else if (isMoving) stateText = "HOVERING";
+                else if (controls.autoRotate) stateText = "AUTO-ROTATE";
+                
+                dbState.innerText = stateText;
+                dbInteract.innerText = isInteracting ? "TRUE" : "FALSE";
+                dbRadius.innerText = targetRadius.toFixed(2);
+                
+                if (isInteracting) dbState.className = 'debug-val val-good';
+                else if (controls.autoRotate) dbState.className = 'debug-val val-warn';
+                else dbState.className = 'debug-val';
+            }
 
             // 2. Physics Simulation
             if (particles && originalPositions && particleRandoms) {
@@ -620,7 +766,6 @@
                             
                             if (dist > 0.001) {
                                 // 2. Whirl / Vortex Force
-                                // Scale by swirlDirection (1 or -1)
                                 const swirlStrength = 0.15 * (0.5 + r) * swirlDirection;
                                 vx += -mDy * swirlStrength * influence; 
                                 vy += mDx * swirlStrength * influence;  
@@ -663,6 +808,9 @@
                 }
 
                 particles.geometry.attributes.position.needsUpdate = true;
+                
+                // CRITICAL: Only update the range of active particles to save bandwidth
+                particles.geometry.attributes.position.updateRange.count = activeParticleCount * 3;
             }
             
             renderer.render(scene, camera);
