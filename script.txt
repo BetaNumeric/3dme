@@ -1,0 +1,693 @@
+<style>
+    /* The canvas overlays the entire screen to allow particles to fly everywhere. */
+    #canvas-container {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        z-index: 1; 
+        /* CRITICAL CHANGE: Allow clicks to pass through to underlying website content */
+        pointer-events: none; 
+        overflow: hidden;
+    }
+    
+    /* Loading Container */
+    #loader {
+        position: fixed; /* Fixed so we can position it anywhere on screen via JS */
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        transition: opacity 0.5s ease;
+        z-index: 10;
+    }
+    
+    /* Spinner Animation */
+    .spinner {
+        width: 40px;
+        height: 40px;
+        border: 3px solid rgba(127, 127, 127, 0.3);
+        border-radius: 50%;
+        border-top-color: #888888;
+        animation: spin 1s ease-in-out infinite;
+        margin-bottom: 12px;
+    }
+    
+    @keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+    
+    .loading-text {
+        font-family: sans-serif;
+        font-size: 14px;
+        font-weight: 600;
+        color: #888888;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+    }
+
+    .hidden { opacity: 0; pointer-events: none; }
+</style>
+
+<div id="canvas-container">
+    <div id="loader">
+        <div class="spinner"></div>
+        <div class="loading-text">Initializing...</div>
+    </div>
+</div>
+
+<!-- Import Map -->
+<script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    // --- CONFIGURATION ---
+    const USER = 'BetaNumeric';
+    const REPO = '3DME';
+    const BRANCH = 'main';
+    const MODEL_FILE_NAME = 'model/me.glb'; 
+    const MODEL_URL = `https://raw.githubusercontent.com/${USER}/${REPO}/${BRANCH}/${MODEL_FILE_NAME}`;
+    
+    // ID of the HTML element to center AND scale the model
+    const TARGET_ELEMENT_ID = '3d-target'; 
+    
+    // Start high - the optimizer will reduce this if needed
+    const PARTICLE_COUNT = 2000000; 
+
+    // --- SHADERS ---
+    const vertexShader = `
+        uniform float uPixelRatio;
+        uniform vec3 uMouse;
+        attribute float aRandom;
+        varying vec2 vUv;
+        void main() {
+            vUv = uv; 
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+            float size = 1.0 + aRandom * 3.5;
+            gl_PointSize = (size * uPixelRatio) / -mvPosition.z;
+        }
+    `;
+
+    const fragmentShader = `
+        uniform sampler2D uTexture; 
+        uniform bool uUseTexture;   
+        varying vec2 vUv;
+        void main() {
+            if (distance(gl_PointCoord, vec2(0.5, 0.5)) > 0.5) discard;
+            vec3 finalColor;
+            if (uUseTexture) {
+                vec4 texColor = texture2D(uTexture, vUv);
+                finalColor = texColor.rgb * 1.2;
+            } else {
+                finalColor = vec3(0.0, 1.0, 1.0);
+            }
+            gl_FragColor = vec4(finalColor, 1.0);
+        }
+    `;
+
+    // --- SETUP ---
+    const container = document.getElementById('canvas-container');
+    const loaderElement = document.getElementById('loader');
+
+    const scene = new THREE.Scene();
+    scene.background = null; // Transparent
+
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 0, 3.5); 
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x000000, 0); 
+    container.appendChild(renderer.domElement);
+
+    // --- INTERACTION STATE ---
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2(-100, -100);
+    const dummyPlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(100, 100),
+        new THREE.MeshBasicMaterial({ visible: false })
+    );
+    scene.add(dummyPlane);
+
+    const mouse3D = new THREE.Vector3(0, 0, 0);
+    const prevMouse3D = new THREE.Vector3(0, 0, 0);
+    const mouseVelocity = new THREE.Vector3(0, 0, 0);
+    
+    let isDragging = false;      
+    let isInteracting = false;   
+    let pulseIntensity = 0;
+    let swirlDirection = 1.0; // 1 = Left Click (Clockwise), -1 = Right Click
+    
+    // Rotation Variables
+    let rotationSpeed = 0;
+    let dragVelocityX = 0;
+    const MAX_ROTATION_SPEED = 0.002;
+    let lastInteractionTime = Date.now();
+    let previousTouchX = 0;
+
+    const customUniforms = {
+        uMouse: { value: new THREE.Vector3(0, 0, 0) },
+        uPixelRatio: { value: window.devicePixelRatio },
+        uTexture: { value: null },
+        uUseTexture: { value: false }
+    };
+
+    // --- PHYSICS DATA & OPTIMIZATION ---
+    let particles = null;
+    let originalPositions, currentPositions, velocities, particleRandoms;
+    
+    let bufferCount = 0; // Capacity of current geometry
+    let activeParticleCount = 0; // Currently rendered count
+    let modelHeight = 1.0; 
+    
+    // Performance Tracking
+    let lastFpsCheck = 0;
+    let frameCount = 0;
+    let lowFpsStreak = 0;
+
+    // --- HELPER: Position & Scale Sync ---
+    function updateModelPosition() {
+        const targetEl = document.getElementById(TARGET_ELEMENT_ID);
+        if (targetEl) {
+            const rect = targetEl.getBoundingClientRect();
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+
+            // 1. Move Loader to center of target element
+            // We use fixed positioning so we just set left/top to screen coords
+            if (!loaderElement.classList.contains('hidden')) {
+                loaderElement.style.left = cx + 'px';
+                loaderElement.style.top = cy + 'px';
+            }
+
+            if (!particles) return;
+
+            const ndcX = (cx / window.innerWidth) * 2 - 1;
+            const ndcY = -(cy / window.innerHeight) * 2 + 1;
+            const vector = new THREE.Vector3(ndcX, ndcY, 0.5);
+            vector.unproject(camera);
+            const dir = vector.sub(camera.position).normalize();
+            const distance = -camera.position.z / dir.z; 
+            const pos = camera.position.clone().add(dir.multiplyScalar(distance));
+            
+            particles.position.copy(pos);
+
+            const vFOV = THREE.MathUtils.degToRad(camera.fov);
+            const visibleHeightAtZ0 = 2 * Math.tan(vFOV / 2) * camera.position.z;
+            const screenPct = rect.height / window.innerHeight;
+            const desiredHeight3D = visibleHeightAtZ0 * screenPct;
+            
+            if (modelHeight > 0 && rect.height > 0) {
+                const scale = desiredHeight3D / modelHeight;
+                particles.scale.setScalar(scale);
+            }
+        }
+    }
+
+    // --- HELPER: Buffer Compaction (Hard Optimization) ---
+    function compactBuffers(newCount) {
+        console.log(`Compacting buffers: ${bufferCount} -> ${newCount}`);
+        
+        // 1. Slice Arrays
+        const newPos = currentPositions.slice(0, newCount * 3);
+        const newOrig = originalPositions.slice(0, newCount * 3);
+        const newVel = velocities.slice(0, newCount * 3);
+        const newRand = particleRandoms.slice(0, newCount);
+        
+        // Grab UVs from existing geometry
+        const oldUv = particles.geometry.attributes.uv.array;
+        const newUv = oldUv.slice(0, newCount * 2);
+
+        // 2. Update Refs
+        originalPositions = newOrig;
+        velocities = newVel;
+        particleRandoms = newRand;
+        
+        // 3. New Geometry
+        const newGeo = new THREE.BufferGeometry();
+        newGeo.setAttribute('position', new THREE.BufferAttribute(newPos, 3));
+        newGeo.setAttribute('uv', new THREE.BufferAttribute(newUv, 2));
+        newGeo.setAttribute('aRandom', new THREE.BufferAttribute(newRand, 1));
+        
+        // 4. Swap
+        particles.geometry.dispose();
+        particles.geometry = newGeo;
+        currentPositions = particles.geometry.attributes.position.array;
+        
+        // 5. Update State
+        particles.geometry.setDrawRange(0, newCount);
+        bufferCount = newCount;
+        activeParticleCount = newCount;
+        particles.frustumCulled = false; 
+    }
+
+    // --- HELPER: Geometry Sampling & Shuffling ---
+    function sampleGeometry(geometry, count) {
+        const positions = new Float32Array(count * 3);
+        const uvs = new Float32Array(count * 2);
+        const posAttr = geometry.attributes.position;
+        const uvAttr = geometry.attributes.uv;
+        const indexAttr = geometry.index;
+        
+        const getPos = (i, target) => {
+            const idx = indexAttr ? indexAttr.getX(i) : i;
+            target.fromBufferAttribute(posAttr, idx);
+        };
+        const getUv = (i, target) => {
+            if (!uvAttr) return target.set(0,0);
+            const idx = indexAttr ? indexAttr.getX(i) : i;
+            target.fromBufferAttribute(uvAttr, idx);
+        };
+
+        const faceCount = (indexAttr ? indexAttr.count : posAttr.count) / 3;
+        const areas = [];
+        let totalArea = 0;
+        const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+
+        for (let i = 0; i < faceCount; i++) {
+            getPos(i * 3, a); getPos(i * 3 + 1, b); getPos(i * 3 + 2, c);
+            const area = 0.5 * new THREE.Vector3().crossVectors(new THREE.Vector3().subVectors(b, a), new THREE.Vector3().subVectors(c, a)).length();
+            areas.push(area);
+            totalArea += area;
+        }
+
+        let generated = 0;
+        let cumulative = 0;
+        const uvA = new THREE.Vector2(), uvB = new THREE.Vector2(), uvC = new THREE.Vector2();
+
+        for (let i = 0; i < faceCount; i++) {
+            cumulative += areas[i];
+            const target = Math.floor((cumulative / totalArea) * count);
+            const n = target - generated;
+            if (n <= 0) continue;
+
+            getPos(i * 3, a); getPos(i * 3 + 1, b); getPos(i * 3 + 2, c);
+            getUv(i * 3, uvA); getUv(i * 3 + 1, uvB); getUv(i * 3 + 2, uvC);
+
+            for (let j = 0; j < n; j++) {
+                const r1 = Math.random(), r2 = Math.random();
+                const sqrtR1 = Math.sqrt(r1);
+                const u = 1 - sqrtR1, v = sqrtR1 * (1 - r2), w = sqrtR1 * r2;
+
+                positions[generated*3] = a.x*u + b.x*v + c.x*w;
+                positions[generated*3+1] = a.y*u + b.y*v + c.y*w;
+                positions[generated*3+2] = a.z*u + b.z*v + c.z*w;
+                
+                uvs[generated*2] = uvA.x*u + uvB.x*v + uvC.x*w;
+                uvs[generated*2+1] = uvA.y*u + uvB.y*v + uvC.y*w;
+                generated++;
+            }
+        }
+        return { positions, uvs };
+    }
+
+    function shuffleIndices(count) {
+        const indices = new Uint32Array(count);
+        for (let i = 0; i < count; i++) indices[i] = i;
+        for (let i = count - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [indices[i], indices[j]] = [indices[j], indices[i]];
+        }
+        return indices;
+    }
+
+    // --- LOADING ---
+    const gltfLoader = new GLTFLoader();
+    gltfLoader.load(MODEL_URL, (gltf) => {
+        const model = gltf.scene;
+        let texture = null;
+        
+        model.updateMatrixWorld(true);
+        model.traverse((child) => {
+            if (child.isMesh && !particles) {
+                const tempGeo = child.geometry.clone();
+                tempGeo.applyMatrix4(child.matrixWorld);
+                
+                // Center Geometry & Compute Height for Scaling
+                tempGeo.computeBoundingBox();
+                const bbox = tempGeo.boundingBox;
+                modelHeight = bbox.max.y - bbox.min.y;
+                
+                const center = new THREE.Vector3();
+                bbox.getCenter(center);
+                tempGeo.translate(-center.x, -center.y, -center.z);
+                
+                if (child.material.map) texture = child.material.map;
+                
+                const sampled = sampleGeometry(tempGeo, PARTICLE_COUNT);
+                const indices = shuffleIndices(PARTICLE_COUNT);
+                const pos = new Float32Array(PARTICLE_COUNT * 3);
+                const uv = new Float32Array(PARTICLE_COUNT * 2);
+                
+                for(let i=0; i<PARTICLE_COUNT; i++) {
+                    const src = indices[i];
+                    pos[i*3] = sampled.positions[src*3];
+                    pos[i*3+1] = sampled.positions[src*3+1];
+                    pos[i*3+2] = sampled.positions[src*3+2];
+                    uv[i*2] = sampled.uvs[src*2];
+                    uv[i*2+1] = sampled.uvs[src*2+1];
+                }
+
+                const geo = new THREE.BufferGeometry();
+                geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+                
+                bufferCount = PARTICLE_COUNT;
+                activeParticleCount = PARTICLE_COUNT;
+                originalPositions = new Float32Array(pos);
+                currentPositions = geo.attributes.position.array;
+                velocities = new Float32Array(bufferCount * 3);
+                particleRandoms = new Float32Array(bufferCount);
+                for(let i=0; i<bufferCount; i++) particleRandoms[i] = Math.random();
+                geo.setAttribute('aRandom', new THREE.BufferAttribute(particleRandoms, 1));
+
+                if (texture) {
+                    customUniforms.uTexture.value = texture;
+                    customUniforms.uUseTexture.value = true;
+                }
+
+                const mat = new THREE.ShaderMaterial({
+                    uniforms: customUniforms,
+                    vertexShader: vertexShader,
+                    fragmentShader: fragmentShader,
+                    transparent: false, depthWrite: true, blending: THREE.NormalBlending
+                });
+
+                particles = new THREE.Points(geo, mat);
+                particles.frustumCulled = false;
+                
+                scene.add(particles);
+                loaderElement.classList.add('hidden');
+                
+                // Init performance timer
+                lastFpsCheck = performance.now();
+                updateModelPosition();
+            }
+        });
+    });
+
+    // --- INPUT HANDLING ---
+    
+    function updateMouse(x, y) {
+        mouse.x = (x / window.innerWidth) * 2 - 1;
+        mouse.y = -(y / window.innerHeight) * 2 + 1;
+    }
+    
+    function interact() {
+        lastInteractionTime = Date.now();
+    }
+    
+    // Checks if the user is hovering over a button or link
+    function isInteractiveElement(target) {
+        return target.closest('a, button, input, textarea, select, [role="button"]');
+    }
+
+    // Prevent context menu
+    window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    window.addEventListener('mousemove', (e) => { 
+        updateMouse(e.clientX, e.clientY); 
+        
+        // Manual drag rotation
+        if (isDragging) {
+            dragVelocityX = e.movementX * 0.005;
+            interact(); 
+        }
+    });
+    
+    window.addEventListener('mousedown', (e) => { 
+        // FIX: Ignore clicks on interactive elements so navigation works
+        if (isInteractiveElement(e.target)) return;
+        
+        isDragging = true; 
+        dragVelocityX = 0; 
+        pulseIntensity = 0.8; 
+        
+        // Check for Right Click
+        swirlDirection = (e.button === 2) ? -1.0 : 1.0;
+        
+        interact(); 
+    });
+    
+    window.addEventListener('mouseup', () => { isDragging = false; });
+    
+    window.addEventListener('touchstart', (e) => {
+        // FIX: Ignore touches on interactive elements
+        if (isInteractiveElement(e.target)) return;
+        
+        if(e.touches.length > 0) {
+            const tx = e.touches[0].clientX;
+            const ty = e.touches[0].clientY;
+            
+            updateMouse(tx, ty);
+            previousTouchX = tx;
+            isDragging = true; 
+            pulseIntensity = 0.8; 
+            dragVelocityX = 0;
+            swirlDirection = 1.0; // Touch is always left-click equivalent
+            interact();
+            
+            dummyPlane.lookAt(camera.position);
+            raycaster.setFromCamera(mouse, camera);
+            const hits = raycaster.intersectObject(dummyPlane);
+            if(hits.length>0) {
+                prevMouse3D.copy(hits[0].point);
+                mouse3D.copy(hits[0].point);
+                if (particles) mouse3D.sub(particles.position); 
+                // Fix initial touch rotation issue
+                if (particles) mouse3D.applyQuaternion(particles.quaternion.clone().invert());
+                customUniforms.uMouse.value.copy(mouse3D);
+            }
+        }
+    }, {passive: false});
+    
+    window.addEventListener('touchend', () => { isDragging = false; });
+    
+    window.addEventListener('touchmove', (e) => { 
+        if(e.touches.length > 0) {
+            const tx = e.touches[0].clientX;
+            const ty = e.touches[0].clientY;
+            updateMouse(tx, ty);
+            
+            const deltaX = tx - previousTouchX;
+            dragVelocityX = deltaX * 0.005;
+            previousTouchX = tx;
+        }
+    }, {passive: false});
+
+    // --- ANIMATION LOOP ---
+    function animate() {
+        requestAnimationFrame(animate);
+        
+        // Sync position to HTML Element
+        updateModelPosition();
+
+        // --- ADAPTIVE OPTIMIZER ---
+        const currentTime = performance.now();
+        frameCount++;
+        
+        if (currentTime - lastFpsCheck >= 1000) {
+            const fps = frameCount; 
+            frameCount = 0;
+            lastFpsCheck = currentTime;
+            
+            // If FPS is low (< 35) and we still have room to optimize (> 10k particles)
+            if (fps < 35 && activeParticleCount > 10000) {
+                lowFpsStreak++;
+                if (lowFpsStreak >= 2) {
+                    const newCount = Math.floor(activeParticleCount * 0.7); // Drop by 30%
+                    activeParticleCount = newCount;
+                    particles.geometry.setDrawRange(0, activeParticleCount);
+                    
+                    console.log(`Low FPS (${fps}). Optimization Triggered. New count: ${activeParticleCount}`);
+                    
+                    // Buffer Compaction: If we are wasting >25% memory, clean it up
+                    if (activeParticleCount < bufferCount * 0.75) {
+                         compactBuffers(activeParticleCount);
+                    }
+                    lowFpsStreak = 0; 
+                }
+            } else {
+                lowFpsStreak = 0;
+            }
+        }
+
+        // Rotation Logic
+        if (isDragging) {
+            rotationSpeed = dragVelocityX;
+        } else {
+            if (Date.now() - lastInteractionTime > 3000) {
+                if (rotationSpeed < MAX_ROTATION_SPEED) rotationSpeed += 0.0001;
+            } else {
+                rotationSpeed *= 0.95;
+            }
+        }
+        
+        if (particles) {
+            if (Math.abs(rotationSpeed) > 0.00001) {
+                particles.rotation.y += rotationSpeed;
+            }
+        }
+
+        if (pulseIntensity > 0) {
+            pulseIntensity *= 0.92;
+            if (pulseIntensity < 0.01) pulseIntensity = 0;
+        }
+
+        dummyPlane.lookAt(camera.position);
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObject(dummyPlane);
+
+        if (intersects.length > 0) {
+            const point = intersects[0].point;
+            
+            // 1. Calculate World Velocity
+            mouseVelocity.copy(point).sub(prevMouse3D);
+            
+            // 2. Store World Position for next frame
+            prevMouse3D.copy(point);
+            
+            // 3. Transform to Local Space
+            mouse3D.copy(point);
+            if (particles) {
+                // Transform Position
+                mouse3D.sub(particles.position);
+                mouse3D.applyQuaternion(particles.quaternion.clone().invert());
+                mouse3D.divide(particles.scale);
+                
+                // Transform Velocity: Apply inverse rotation so drag matches visual direction
+                // We use a clone of velocity so we don't mess up the physics logic if it used world velocity elsewhere (it doesn't, but safe)
+                mouseVelocity.applyQuaternion(particles.quaternion.clone().invert());
+                mouseVelocity.divide(particles.scale);
+            }
+            
+            customUniforms.uMouse.value.copy(mouse3D);
+        } else {
+            mouseVelocity.set(0,0,0);
+        }
+
+        const mouseSpeed = mouseVelocity.length();
+        const isMoving = mouseSpeed > 0.02;
+        isInteracting = isDragging || isMoving || pulseIntensity > 0;
+
+        let targetRadius = 0.01;
+        if (isDragging) targetRadius = Math.max(mouseSpeed * 4.0, 0.3 * zoomScale);
+        else if (isMoving) targetRadius = Math.max(mouseSpeed * 4.0, 0.1 * zoomScale);
+        
+        if (pulseIntensity > 0) targetRadius = Math.max(targetRadius, pulseIntensity);
+        targetRadius = Math.min(targetRadius, 0.8);
+
+        const interactionRadius = isInteracting ? targetRadius : 0.01;
+        const interactionRadiusSq = interactionRadius * interactionRadius;
+
+        if (particles && originalPositions) {
+            const now = Date.now() * 0.006;
+            
+            // Calculate View Axis in Local Space for Rotation-Independent Swirl
+            // Camera is at (0,0,Z) looking at -Z. World view axis is +Z (0,0,1).
+            // We rotate (0,0,1) into the model's local space.
+            const localViewAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(particles.quaternion.clone().invert()).normalize();
+            
+            for (let i = 0; i < activeParticleCount; i++) {
+                const ix = i * 3; const iy = i * 3 + 1; const iz = i * 3 + 2;
+                let px = currentPositions[ix];
+                let py = currentPositions[iy];
+                let pz = currentPositions[iz];
+                
+                let vx = velocities[ix]; let vy = velocities[iy]; let vz = velocities[iz];
+                const r = particleRandoms[i];
+
+                // Spring
+                vx += (originalPositions[ix] - px) * (0.001 * (0.5 + r));
+                vy += (originalPositions[iy] - py) * (0.001 * (0.5 + r));
+                vz += (originalPositions[iz] - pz) * (0.001 * (0.5 + r));
+
+                // Interaction
+                const mDx = px - mouse3D.x;
+                const mDy = py - mouse3D.y;
+                const mDz = pz - mouse3D.z;
+                const distSq = mDx*mDx + mDy*mDy + mDz*mDz;
+
+                if (distSq < interactionRadiusSq) {
+                    const dist = Math.sqrt(distSq);
+                    const influence = (1.0 - (distSq / interactionRadiusSq));
+                    
+                    if (isInteracting) {
+                        const force = (0.8 + r * 0.4);
+                        vx += mouseVelocity.x * force * influence * 0.2;
+                        vy += mouseVelocity.y * force * influence * 0.2;
+                        vz += mouseVelocity.z * force * influence * 0.2;
+
+                        if (dist > 0.001) {
+                            // Swirl (Screen-Space Independent)
+                            // F = localViewAxis x distanceVector
+                            const swirl = 0.15 * (0.5 + r) * swirlDirection;
+                            
+                            // Cross Product manually
+                            const sx = localViewAxis.y * mDz - localViewAxis.z * mDy;
+                            const sy = localViewAxis.z * mDx - localViewAxis.x * mDz;
+                            const sz = localViewAxis.x * mDy - localViewAxis.y * mDx;
+                            
+                            vx += sx * swirl * influence;
+                            vy += sy * swirl * influence;
+                            vz += sz * swirl * influence;
+                            
+                            // Pulse
+                            const pulse = Math.sin(now + r * 6.28);
+                            const rad = 0.05 * pulse * force;
+                            vx += (mDx / dist) * rad * influence;
+                            vy += (mDy / dist) * rad * influence;
+                            vz += (mDz / dist) * rad * influence;
+                        }
+                        
+                        if (pulseIntensity > 0) {
+                            const pForce = pulseIntensity * 0.05;
+                            vx += (mDx / dist) * pForce * influence;
+                            vy += (mDy / dist) * pForce * influence;
+                            vz += (mDz / dist) * pForce * influence;
+                        }
+                    }
+                }
+
+                vx *= 0.90; vy *= 0.90; vz *= 0.90;
+                px += vx; py += vy; pz += vz;
+                
+                currentPositions[ix] = px; currentPositions[iy] = py; currentPositions[iz] = pz;
+                velocities[ix] = vx; velocities[iy] = vy; velocities[iz] = vz;
+            }
+            particles.geometry.attributes.position.needsUpdate = true;
+            // Only update the active range to save bandwidth
+            particles.geometry.attributes.position.updateRange.count = activeParticleCount * 3;
+        }
+
+        renderer.render(scene, camera);
+    }
+    
+    // Pre-calculate zoomScale since camera Z is fixed
+    const zoomScale = 3.5 / 3.0; // camera.z / base
+    
+    animate();
+
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        customUniforms.uPixelRatio.value = window.devicePixelRatio;
+    });
+</script>
